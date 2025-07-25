@@ -592,3 +592,44 @@ class SAILORTrainer:
             print(f"Round {round_id} took {time.time() - start_time} seconds")
             if self.logger is not None:
                 self.logger.scalar(f"round_time", time.time() - start_time)
+
+        if self.config.train_dp_mppi_params["perform_final_policy_iteration"]:
+            cprint("\nPerforming Final Policy Iteration", "green")
+            self.final_policy_iteration()
+
+    def final_policy_iteration(self):
+        relabelled_buffer = self.relabel_with_mppi_post(
+            num_trajs_to_relabel=self.config.train_dp_mppi_params[
+                "final_policy_iteration_num_trajs"
+            ],
+            select_from_end=True,
+        )
+
+        # Reset diffusion policy trainer
+        del self.base_policy.trainer
+        self.base_policy.initialize_trainer()
+        self.base_policy.name = "DP_Final_Policy_Iteration"
+
+        cprint(
+            f"\nStarting Final Policy Iteration with {len(relabelled_buffer.keys())} trajectories and "
+            f"{self.config.train_dp_mppi_params['final_policy_iteration_num_steps']} steps",
+            "green",
+        )
+
+        # Train DP with the relabelled buffer
+        dp_dataset = make_retrain_dp_dataset(
+            replay_buffer=relabelled_buffer,
+            expert_eps=self.expert_eps,
+            config=self.config,
+        )
+        self._step = self.base_policy.train_base_policy(
+            train_dataset=dp_dataset,
+            expert_val_eps=self.expert_val_eps,
+            eval_envs=self.eval_envs,
+            init_step=self._step,
+            train_steps=self.config.train_dp_mppi_params[
+                "final_policy_iteration_num_steps"
+            ],
+            log_prefix="final_policy_iteration",
+            run_eval=True,
+        )

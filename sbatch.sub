@@ -1,0 +1,49 @@
+#!/bin/bash
+#SBATCH -e /share/portal/vm392/diffusion_dreamer/sbatch/errs/%j.err                   # error log file (%j expands to jobID)
+#SBATCH -o /share/portal/vm392/diffusion_dreamer/sbatch/outs/%j.out                  # output file (%j expands to jobID)
+#SBATCH --mail-type=NONE                        # Request status by email
+#SBATCH --mail-user=vm392@cornell.edu          # Email address to send results to.
+#SBATCH -N 1                                    # Total number of nodes requested
+#SBATCH -n 8                                    # Total number of cores requested
+#SBATCH --get-user-env                          # Retrieve the user's login environment
+#SBATCH --mem=60GB                              # Server memory requested (per node)
+#SBATCH --time=168:00:00                          # Time limit (hh:mm:ss)
+#SBATCH --partition=portal                      # Request partition
+#SBATCH --gres=gpu:6000ada:1                    # Number of GPUs needed
+#SBATCH --constraint="gpu-high"
+
+# Take 4 required inputs: SUITE, TASK, NUM_EXP_TRAJS, SEED, and 1 optional NAME
+SUITE=$1
+TASK=$2
+NUM_EXP_TRAJS=$3
+SEED=$4
+NAME=$5
+
+if [ -z "$SUITE" ] || [ -z "$TASK" ] || [ -z "$NUM_EXP_TRAJS" ] || [ -z "$SEED" ]; then
+    echo "Usage: $0 <SUITE> <TASK> <NUM_EXP_TRAJS> <SEED> [NAME]"
+    exit 1
+fi
+
+# Activate the correct conda environment
+source ~/.bashrc
+conda activate ${SUITE}_env
+
+# Set experiment name, with optional prefix
+if [ -z "$NAME" ]; then
+    EXP_NAME="seed${SEED}"
+else
+    EXP_NAME="${NAME}_seed${SEED}"
+fi
+
+# Run training
+python3 train_sailor.py \
+    --configs cfg_dp_mppi ${SUITE} \
+    --wandb_project SAILOR_${SUITE} \
+    --wandb_exp_name "${EXP_NAME}" \
+    --task "${SUITE}__${TASK}" \
+    --num_exp_trajs ${NUM_EXP_TRAJS} \
+    --seed ${SEED}
+
+# Example command to run robomimic square on 25 trajectories, seed 0, with optional name
+# sbatch sbatch.sub robomimic square 25 0 [myexp]
+# sbatch sbatch.sub robomimic lift 5 0 expert_itr

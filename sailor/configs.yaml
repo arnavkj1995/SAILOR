@@ -165,6 +165,11 @@ defaults:
     discrim_state_only: True
     upate_discrim_every: 100
 
+    # Final policy iteration
+    perform_final_policy_iteration: True
+    final_policy_iteration_num_trajs: 192
+    final_policy_iteration_num_steps: 12000
+
 robomimic:
   done_mode: 1 # can be 0, 1, 2
   action_repeat: 1
@@ -277,7 +282,7 @@ debug:
   train_dp_mppi_params:
     # Warmstart
     force_warmup: True # TODO: change to false after formalizing critic
-    n_env_steps: 230
+    n_env_steps: 90
     min_env_steps_per_round: 20
     update_dp_every: 2
     n_dp_train_itrs: 10
@@ -288,3 +293,5 @@ debug:
 
     use_discrim: true
     upate_discrim_every: 2
+
+    final_policy_iteration_num_steps: 20
