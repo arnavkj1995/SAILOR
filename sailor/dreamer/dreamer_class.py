@@ -84,7 +84,7 @@ class Dreamer(nn.Module):
     def reset(self):
         self._task_behavior.reset()
 
-    def _train(self, data, training_step):
+    def _train(self, data, training_step, is_warmstart):
         # Obs shape BS x BL x ... x stack_dim
         metrics = {}
         data_wm = select_latest_obs(data)  # Select only last obs and remove stacking
@@ -111,6 +111,7 @@ class Dreamer(nn.Module):
                 start,
                 reward,
                 training_step,
+                is_warmstart=is_warmstart,
             )[-1]
         )
         return metrics

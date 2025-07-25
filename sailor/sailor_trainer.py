@@ -111,7 +111,7 @@ class SAILORTrainer:
 
         return base_policy
 
-    def train_wm_critic(self, itrs):
+    def train_wm_critic(self, itrs, is_warmstart):
         num_buffer_transitions = count_n_transitions(self.replay_buffer)
         print("Number of expert transitions: ", self.num_expert_transitions)
         print("Number of buffer transitions: ", num_buffer_transitions)
@@ -140,6 +140,7 @@ class SAILORTrainer:
             metrics = self.dreamer_class._train(
                 data=batch,
                 training_step=self._step,
+                is_warmstart=is_warmstart,
             )
             self._step += 1
 
@@ -441,7 +442,7 @@ class SAILORTrainer:
             expert_eps=self.expert_eps,
             dreamer_class=self.dreamer_class,
         )
-        self.train_wm_critic(itrs=num_warmstart_itrs)
+        self.train_wm_critic(itrs=num_warmstart_itrs, is_warmstart=True)
         self._env_step += count_n_transitions(self.replay_buffer)
 
     def collect_trajs(self):
@@ -512,7 +513,8 @@ class SAILORTrainer:
                 itrs=int(
                     self.config.train_dp_mppi_params["rounds_train_ratio"]
                     * n_steps_collected
-                )
+                ),
+                is_warmstart=False,
             )
 
             if round_id % self.config.train_dp_mppi_params["eval_every_round"] == 0:

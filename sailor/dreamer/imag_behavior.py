@@ -4,6 +4,7 @@ import einops
 import torch
 import torch.nn as nn
 
+from sailor.classes.actor_net import ActorNet
 from sailor.dreamer import tools
 from sailor.dreamer.networks import MLPEnsemble
 
@@ -39,6 +40,22 @@ class ImagBehavior(nn.Module):
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
+
+        kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
+        if config.use_residual_actor:
+            self.actor = ActorNet(config=config, base_policy=base_policy)
+            self._actor_opt = tools.Optimizer(
+                "residual_actor",
+                self.actor.parameters(),
+                config.residual_actor["lr"],
+                config.residual_actor["eps"],
+                config.residual_actor["grad_clip"],
+                **kw,
+            )
+            print(
+                f"Optimizer actor_opt has {sum(param.numel() for param in self.actor.parameters())} variables."
+            )
+
         self.value = MLPEnsemble(
             config.critic["num_models"],
             config.critic["num_subsample"],
@@ -56,7 +73,6 @@ class ImagBehavior(nn.Module):
         if config.critic["slow_target"]:
             self._slow_value = copy.deepcopy(self.value)
             self._updates = 0
-        kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
         self._value_opt = tools.Optimizer(
             "value",
             self.value.parameters(),
@@ -125,11 +141,104 @@ class ImagBehavior(nn.Module):
         bc_loss = torch.nn.functional.mse_loss(actor_action, expert_action)
         return bc_loss
 
+    def imagine_with_actor(self, input_data, objective, update_actor=False):
+        metrics = {}
+        actor_loss = None
+        with tools.RequiresGrad(self.actor):
+            with torch.amp.autocast("cuda", enabled=self._use_amp):
+                # Get imagined rollout of policy in the current world model
+                imag_feat, imag_state, imag_action_dict = self._imagine(
+                    input_data,
+                    horizon=self._config.imag_horizon,
+                    mode="default" if update_actor else "base_only",
+                    policy=self.actor,
+                )
+                # imag_feat: 15 x (BS*BL) x feat_size => 15=imag_horizon
+                # Everything else is 15 x (BS*BL) x ...
+
+                # Get predicted reward for the horizon steps using imag_state (check objective in dreamer.py)
+                reward = objective(imag_feat, imag_state, None)
+
+                # Actor(imag_feat) returns a distribution
+                # Entropy: computes entropy of actor policy E_{x~p(x)}[-log(p(x))]
+                # Higher the entropy, more spread out the policy is
+                # actor_ent: 15 x (BS*BL)
+                actor_ent = self.actor.get_entropy(
+                    feat=imag_feat, base_action=imag_action_dict["base_action"]
+                )
+
+                # Compute the target values using bootstrapping and terminal value fn
+                target, weights, base = self._compute_target(
+                    imag_feat, imag_state, reward
+                )
+
+                # Compute the actor loss, use only the residual action for the loss
+                # As the update rule is
+                # pi(a_t | s_t) = pi_B(a_b | s_t) + pi_R(a_r | s_t, a_b)
+                # E_{tau ~ pi} [ sum_{t=0}^{T} [ ∇ log(pi_R(a_r | s_t, a_b)) * Advantage ] ]
+                # Note: Advantage is computed using the full action
+                # NOTE: currently detatching the residual action as done in standard policy gradients
+                if update_actor:
+                    actor_loss, mets = self._compute_actor_loss(
+                        imag_feat=imag_feat,
+                        base_policy_actions=imag_action_dict["base_action"],
+                        imag_action=imag_action_dict["residual_action"],
+                        target=target,
+                        weights=weights,
+                        base=base,
+                    )
+
+                    actor_loss -= (
+                        self._config.residual_actor["entropy"]
+                        * actor_ent[:-1, ..., None]
+                    )
+                    actor_loss = torch.mean(actor_loss)
+                    mets["actor_orig_loss"] = actor_loss.item()
+
+                    # Get BC loss for expert buffer
+                    bc_loss = self.compute_bc_loss(input_data, imag_action_dict)
+                    mets["actor_bc_loss"] = bc_loss.item()
+
+                    # L2 norm loss
+                    res_l2_norm = torch.norm(
+                        imag_action_dict["residual_action"], dim=-1
+                    ).mean()
+
+                    if self._config.residual_training["action_l2_reg_weight"] != 0:
+                        # Scale factor = (curr_l2_norm / target_l2_norm) * weight
+                        scale_factor = float(
+                            (
+                                res_l2_norm.item()
+                                / self._config.residual_training[
+                                    "action_l2_norm_target"
+                                ]
+                            )
+                            * self._config.residual_training["action_l2_reg_weight"]
+                        )
+                        metrics["actor_res_l2_norm_scale_factor"] = scale_factor
+
+                        actor_loss += scale_factor * res_l2_norm
+
+                    metrics["actor_res_l2_norm"] = res_l2_norm.item()
+                    metrics.update(mets)
+
+        return (
+            metrics,
+            reward,
+            imag_feat,
+            imag_state,
+            imag_action_dict,
+            weights,
+            target,
+            actor_loss,
+        )
+
     def _train(
         self,
         input_data,
         objective,
         training_step,
+        is_warmstart,
     ):
         """
         Train the actor and value networks
@@ -138,17 +247,32 @@ class ImagBehavior(nn.Module):
         metrics = {}
 
         # Get imagined rollout of the base policy in the current world model
-        imag_feat, imag_state, imag_action_dict = self._imagine(
-            input_data,
-            self._config.imag_horizon,
-            mode="base_only",
-        )
+        if self._config.use_residual_actor:
+            (
+                metrics_actor,
+                reward,
+                imag_feat,
+                imag_state,
+                imag_action_dict,
+                weights,
+                target,
+                actor_loss,
+            ) = self.imagine_with_actor(
+                input_data, objective, update_actor=not is_warmstart
+            )
+            metrics.update(metrics_actor)
+        else:
+            imag_feat, imag_state, imag_action_dict = self._imagine(
+                input_data,
+                self._config.imag_horizon,
+                mode="base_only",
+            )
 
-        # Get predicted reward for the horizon steps using imag_state and base policy actions
-        reward = objective(imag_feat, imag_state, imag_action_dict["base_action"])
+            # Get predicted reward for the horizon steps using imag_state and base policy actions
+            reward = objective(imag_feat, imag_state, imag_action_dict["base_action"])
 
-        # Compute the target values using bootstrapping and terminal value fn
-        target, weights, _ = self._compute_target(imag_feat, imag_state, reward)
+            # Compute the target values using bootstrapping and terminal value fn
+            target, weights, _ = self._compute_target(imag_feat, imag_state, reward)
 
         # Compute the critic losses
         with tools.RequiresGrad(self.value):
@@ -178,15 +302,18 @@ class ImagBehavior(nn.Module):
 
         # Train the value network
         with tools.RequiresGrad(self):
+            if not is_warmstart:
+                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
 
         return imag_feat, imag_state, None, weights, metrics
 
-    def _imagine(self, input_data, horizon, mode="base_only"):
+    def _imagine(self, input_data, horizon, mode="base_only", policy: ActorNet = None):
         """
         MODE:
         - base_only: Use only base actions for imagination [used during training]
         - residual_buffer: Use residual actions from buffer [used during value estimation]
+        - default: Use residual policy from dreamer
         """
         assert mode in ["default", "residual_buffer", "base_only"]
         dynamics = self._world_model.dynamics
@@ -210,7 +337,9 @@ class ImagBehavior(nn.Module):
             elif mode == "residual_buffer":
                 residual_policy_action = residual_action[..., state["ID"]]
             else:
-                raise NotImplementedError(mode)
+                residual_policy_action = policy.get_residual_dist(
+                    feat=feat.detach(), base_action=base_policy_action
+                ).sample()
             action_dict = {
                 "base_action": base_policy_action,
                 "residual_action": residual_policy_action,
@@ -245,6 +374,11 @@ class ImagBehavior(nn.Module):
         self.base_policy.reset()
 
     def get_action(self, obs, feat, latent, weighting_in_base=True):
+        if self._config.use_residual_actor:
+            action_dict = self.actor.get_action(obs, feat, weighting_in_base)
+            action_dict["residual_action"] = action_dict["residual_action"].mode()
+            return action_dict
+
         with torch.no_grad():
             base_action = self.base_policy.get_action(
                 obs, weighting=weighting_in_base, get_full_action=True
@@ -462,6 +596,53 @@ class ImagBehavior(nn.Module):
             torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
         ).detach()
         return target, weights, value[:-1]
+
+    def _compute_actor_loss(
+        self,
+        imag_feat,
+        base_policy_actions,
+        imag_action,
+        target,
+        weights,
+        base,
+    ):
+        metrics = {}
+        inp = imag_feat.detach()
+        # Note: policy here is only the residual policy action as required to compute reinforce update for Residual Policy
+        policy = self.actor.get_residual_dist(feat=inp, base_action=base_policy_actions)
+        # Q-val for actor is not transformed using symlog
+        target = torch.stack(target, dim=1)
+        if self._config.reward_EMA:
+            offset, scale = self.reward_ema(target, self.ema_vals)
+            normed_target = (target - offset) / scale
+            normed_base = (base - offset) / scale
+            adv = normed_target - normed_base
+            metrics.update(tools.tensorstats(normed_target, "normed_target"))
+            metrics["EMA_005"] = to_np(self.ema_vals[0])
+            metrics["EMA_095"] = to_np(self.ema_vals[1])
+
+        if self._config.imag_gradient == "dynamics":
+            actor_target = target
+        elif self._config.imag_gradient == "reinforce":
+            actor_target = (
+                policy.log_prob(imag_action)[:-1][:, :, None]
+                * (target - self.value(imag_feat[:-1]).mode()).detach()
+            )
+        elif self._config.imag_gradient == "both":
+            actor_target = (
+                policy.log_prob(imag_action)[:-1][:, :, None]
+                * (target - self.value(imag_feat[:-1]).mode()).detach()
+            )
+            mix = self._config.imag_gradient_mix
+            actor_target = mix * target + (1 - mix) * actor_target
+            metrics["imag_gradient_mix"] = mix
+        else:
+            raise NotImplementedError(self._config.imag_gradient)
+        actor_loss = -weights[:-1] * actor_target
+
+        metrics.update(tools.tensorstats(actor_target, "actor_target"))
+        metrics.update(tools.tensorstats(weights[:-1], "weights"))
+        return actor_loss, metrics
 
     def _update_slow_target(self):
         if self._config.critic["slow_target"]:

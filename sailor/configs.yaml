@@ -166,9 +166,18 @@ defaults:
     upate_discrim_every: 100
 
     # Final policy iteration
-    perform_final_policy_iteration: True
+    perform_final_policy_iteration: False
     final_policy_iteration_num_trajs: 192
-    final_policy_iteration_num_steps: 12000
+    final_policy_iteration_num_steps: 24000
+
+  # Residual actor
+  use_residual_actor: False
+  imag_gradient: 'dynamics'
+
+  residual_training:
+    abs_residual: 0.2
+    action_l2_reg_weight: 10.0
+    action_l2_norm_target: 0.2
 
 robomimic:
   done_mode: 1 # can be 0, 1, 2
