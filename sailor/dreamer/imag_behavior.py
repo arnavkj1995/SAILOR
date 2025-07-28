@@ -302,7 +302,7 @@ class ImagBehavior(nn.Module):
 
         # Train the value network
         with tools.RequiresGrad(self):
-            if not is_warmstart:
+            if not is_warmstart and self._config.use_residual_actor:
                 metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
 
